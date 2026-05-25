@@ -12,6 +12,16 @@ echo "================================================="
 WORK_DIR="/workspace"
 SCRIPT="${WORK_DIR}/run_oracle_pipeline.sh"
 
+# The dustynv/pytorch base image ships python3 only — no `python` symlink.
+# Several project shell scripts (run_oracle_pipeline.sh,
+# tools/inference_bluepoint_forestsens.sh) call bare `python`, which would
+# fail with "command not found". Add a symlink so every `python` invocation
+# resolves to python3. Idempotent: ln -sf overwrites any existing link.
+if ! command -v python >/dev/null 2>&1; then
+    echo "[0] Adding python -> python3 symlink for legacy scripts"
+    ln -sf "$(command -v python3)" /usr/local/bin/python
+fi
+
 echo
 echo "[1] List /workspace content:"
 ls -lah "${WORK_DIR}" || true
@@ -50,22 +60,43 @@ PYCODE
     pip install --no-deps --no-cache-dir torch-points-kernels==0.7.0
   fi
 
-  echo "[3.2] Reinstall torch-cluster"
-  pip uninstall -y torch-cluster || true
-  pip install --no-deps --no-cache-dir torch-cluster
+  echo "[3.2] Check torch-cluster import (only reinstall on failure)"
+  # On Jetson, our Dockerfile already built torch-cluster from source against
+  # the in-image torch 2.1 with TORCH_CUDA_ARCH_LIST=8.7. An unconditional pip
+  # reinstall would recompile WITHOUT sm_87 and silently overwrite our working
+  # build with a CPU-only (or wrong-arch) one. Only reinstall if import fails.
+  if ! "$PY" - <<'PYCODE'
+try:
+    import torch_cluster  # noqa
+    print("torch-cluster ok")
+except Exception as e:
+    print("torch-cluster import failed:", e)
+    raise SystemExit(1)
+PYCODE
+  then
+    echo "  -> reinstall torch-cluster (with --no-build-isolation so torch is visible)"
+    pip uninstall -y torch-cluster || true
+    TORCH_CUDA_ARCH_LIST="8.7" FORCE_CUDA=1 \
+        pip install --no-deps --no-build-isolation --no-cache-dir torch-cluster
+  fi
 
   echo "[3.3] Replace patched files if present"
-  SITE_PKGS=$("$PY" - <<'PYCODE'
-import site
-c = site.getsitepackages() + [site.getusersitepackages()]
-print([p for p in c if p.endswith("site-packages")][0])
-PYCODE
-)
+  # Locate each target package directly from its __file__, not via
+  # site.getsitepackages() filtering — on this base image, mmengine/mmdet3d
+  # live in /usr/local/lib/python3.10/dist-packages/ (note: 'dist-packages',
+  # not 'site-packages'), and the old filter dropped that path on the floor.
+  MMENGINE_DIR=$("$PY" -c 'import os, mmengine; print(os.path.dirname(mmengine.__file__))')
+  MMDET3D_DIR=$("$PY"  -c 'import os, mmdet3d;  print(os.path.dirname(mmdet3d.__file__))')
+  echo "    mmengine  -> $MMENGINE_DIR"
+  echo "    mmdet3d   -> $MMDET3D_DIR"
+
   REPL_DIR="${WORK_DIR}/replace_mmdetection_files"
   if [[ -d "$REPL_DIR" ]]; then
-    [[ -f "$REPL_DIR/loops.py" ]]         && cp "$REPL_DIR/loops.py"        "$SITE_PKGS/mmengine/runner/" || true
-    [[ -f "$REPL_DIR/base_model.py" ]]    && cp "$REPL_DIR/base_model.py"   "$SITE_PKGS/mmengine/model/base_model/" || true
-    [[ -f "$REPL_DIR/transforms_3d.py" ]] && cp "$REPL_DIR/transforms_3d.py" "$SITE_PKGS/mmdet3d/datasets/transforms/" || true
+    [[ -f "$REPL_DIR/loops.py" ]]         && cp -v "$REPL_DIR/loops.py"        "$MMENGINE_DIR/runner/loops.py"
+    [[ -f "$REPL_DIR/base_model.py" ]]    && cp -v "$REPL_DIR/base_model.py"   "$MMENGINE_DIR/model/base_model/base_model.py"
+    [[ -f "$REPL_DIR/transforms_3d.py" ]] && cp -v "$REPL_DIR/transforms_3d.py" "$MMDET3D_DIR/datasets/transforms/transforms_3d.py"
+  else
+    echo "    WARN: $REPL_DIR not found — patches NOT applied"
   fi
 
   echo "[3.4] Ensure data dirs exist (meta/train_val)"

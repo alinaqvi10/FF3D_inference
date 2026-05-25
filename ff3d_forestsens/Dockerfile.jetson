@@ -1,0 +1,279 @@
+# Dockerfile.jetson — ForestFormer3D inference on Jetson Orin NX
+# Base: dustynv/pytorch:2.1-r36.2.0 (PyTorch 2.1 + CUDA 12.2 + Python 3.10, aarch64)
+# Host requirement: JetPack 6.x (L4T R36.x). Confirmed on JP 6.2 (R36.5).
+# Build context: ff3d_forestsens/
+
+FROM dustynv/pytorch:2.1-r36.2.0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:$PATH \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH \
+    TORCH_CUDA_ARCH_LIST="8.7" \
+    CUMM_CUDA_ARCH_LIST="8.7" \
+    FORCE_CUDA=1 \
+    MAX_JOBS=4 \
+    BLAS=openblas \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1
+
+# --------------------------------------------------------------------------
+# 1. System build dependencies
+# --------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git build-essential cmake ninja-build pkg-config \
+        libopenblas-dev libsparsehash-dev \
+        libgl1 libglib2.0-0 libxrender1 ffmpeg \
+        python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin setuptools to a version that still exposes pkg_resources (removed in setuptools >=80).
+# PIP_CONSTRAINT propagates into pip's build-isolation subprocesses, so mmcv/mmdet/mmdet3d
+# build envs also pick up this pin and don't get a setuptools 80+ that crashes their setup.py.
+RUN mkdir -p /etc/pip-constraints \
+    && printf 'setuptools<70\n' > /etc/pip-constraints/global.txt
+ENV PIP_CONSTRAINT=/etc/pip-constraints/global.txt
+
+RUN pip install --upgrade pip "setuptools<70" wheel \
+    && pip install "packaging>=23" "Cython<3"
+
+# --------------------------------------------------------------------------
+# 2. Pure-Python dependencies (fast)
+# --------------------------------------------------------------------------
+RUN pip install --no-deps \
+        "numpy==1.24.4" \
+        addict==2.4.0 yapf==0.33.0 termcolor==2.3.0 \
+        rich==13.3.5 pycocotools==2.0.6 "Shapely==1.8.5" \
+        scipy==1.10.1 terminaltables==3.1.10 \
+        pandas==2.0.1 python-dateutil==2.8.2 \
+        pyquaternion==0.9.9 trimesh==3.21.6 plyfile==1.0.2 \
+        matplotlib pyparsing cycler kiwisolver \
+        scikit-learn joblib threadpoolctl cachetools \
+        nuscenes-devkit==1.1.10 lyft-dataset-sdk==0.0.8 \
+        pccm==0.4.7 ccimport==0.4.2 pybind11==2.10.4 \
+        lark==1.1.5 pyyaml click six tqdm
+
+# --------------------------------------------------------------------------
+# 3. OpenMMLab framework (Python parts)
+#    mmcv 2.1.0 is the first version officially supporting PyTorch 2.1.
+# --------------------------------------------------------------------------
+RUN pip install --no-deps mmengine==0.7.3 mmcv==2.1.0 mmdet==3.0.0
+
+# --------------------------------------------------------------------------
+# 4. mmdetection3d @ pinned commit (~10-15 min, compiles CUDA ops)
+#    --no-build-isolation: mmdet3d's setup.py imports torch at build time,
+#    so pip's isolated build env (which has no torch) crashes. Reusing the
+#    parent env's torch (from the dustynv base) avoids that.
+# --------------------------------------------------------------------------
+RUN pip install --no-deps --no-build-isolation -v \
+        "git+https://github.com/open-mmlab/mmdetection3d.git@22aaa47fdb53ce1870ff92cb7e3f96ae38d17f61"
+
+# --------------------------------------------------------------------------
+# 5. torch-geometric ecosystem: scatter / cluster / points-kernels
+#    Source builds for aarch64. (~25 min total)
+#    All three setup.py files import torch -> --no-build-isolation.
+# --------------------------------------------------------------------------
+RUN pip install --no-deps --no-build-isolation -v "git+https://github.com/rusty1s/pytorch_scatter.git@2.0.9"
+RUN pip install --no-deps --no-build-isolation -v torch-cluster
+RUN pip install --no-deps --no-build-isolation -v torch-points-kernels==0.7.0
+
+# --------------------------------------------------------------------------
+# 6. spconv + cumm from git (~30-45 min, aarch64 source)
+#    Bare `cumm`/`spconv` on PyPI top out at 0.1.0/1.x (broken — the
+#    maintainer ships newer releases as cumm-cuXXX/spconv-cuXXX precompiled
+#    wheels, none of which have aarch64 builds). Build from git tags instead.
+#    v0.7.11 + v2.3.8 were released the same day (Dec 2024) and paired.
+# --------------------------------------------------------------------------
+# pccm/ccimport pins in layer 5 (0.4.x) are too old for cumm 0.7.x — bump
+# them here so the cumm build doesn't reject them. Doing it in a thin layer
+# preserves the upstream cache for layers 5-10.
+RUN pip install --upgrade --no-deps pccm ccimport
+RUN pip install --no-deps --no-build-isolation -v \
+        "git+https://github.com/FindDefinition/cumm.git@v0.7.11"
+RUN pip install --no-deps --no-build-isolation -v \
+        "git+https://github.com/traveller59/spconv.git@v2.3.8"
+
+# --------------------------------------------------------------------------
+# 7. MinkowskiEngine — community fork with CUDA 12 patches.
+#    The official NVIDIA/MinkowskiEngine repo (last commit Feb 2022) does NOT
+#    compile against CUDA 12 — it uses `thrust::device` which moved namespace
+#    in CUDA 12 (concurrent_unordered_map.cuh:503), and has NVTX3 header
+#    collisions. CiSong10's cuda12-installation branch patches both, based on
+#    MinkowskiEngine 0.5.4 (same version as the original Dockerfile pin).
+#    Python API and math are unchanged — only compilation paths differ.
+#    See: https://github.com/NVIDIA/MinkowskiEngine/issues/621
+#
+#    --force_cuda overrides the torch.cuda.is_available() check (False during
+#    docker build); without it, setup.py silently builds a CPU_ONLY wheel.
+# --------------------------------------------------------------------------
+RUN git clone -b cuda12-installation --depth 1 \
+        https://github.com/CiSong10/MinkowskiEngine.git /opt/MinkowskiEngine \
+    && cd /opt/MinkowskiEngine \
+    && python3 setup.py install --force_cuda --blas=openblas
+
+# --------------------------------------------------------------------------
+# 8. Karbo123/segmentator (~5 min)
+#    Their CMakeLists.txt has `set(CMAKE_CXX_STANDARD 14)` hardcoded, which
+#    overrides any -DCMAKE_CXX_STANDARD=17 flag. PyTorch 2.1 headers require
+#    C++17 (use is_convertible_v, is_same_v, if constexpr, structured
+#    bindings). Patch the CMakeLists in place before cmake runs.
+# --------------------------------------------------------------------------
+RUN git clone https://github.com/Karbo123/segmentator.git /opt/segmentator \
+    && cd /opt/segmentator \
+    && git reset --hard 76efe46d03dd27afa78df972b17d07f2c6cfb696 \
+    && sed -i 's/set(CMAKE_CXX_STANDARD 14)/set(CMAKE_CXX_STANDARD 17)/' csrc/CMakeLists.txt \
+    && cd csrc \
+    && mkdir -p build && cd build \
+    && cmake .. \
+        -DCMAKE_PREFIX_PATH=$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path())') \
+        -DPYTHON_INCLUDE_DIR=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['include'])") \
+        -DPYTHON_LIBRARY=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR') + '/libpython3.10.so')") \
+        -DCMAKE_INSTALL_PREFIX=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])") \
+    && make -j$MAX_JOBS && make install \
+    && rm -rf /opt/segmentator/csrc/build
+
+# --------------------------------------------------------------------------
+# 9. open3d + LAZ point cloud reading
+#    open3d 0.17 has no aarch64 wheel — install latest available.
+# --------------------------------------------------------------------------
+RUN pip install --no-deps open3d
+RUN pip install --no-deps "laspy[lazrs]"
+
+# --------------------------------------------------------------------------
+# 9b. Late-arriving runtime deps (placed after open3d/laspy so the heavy
+#     CUDA-extension layers stay cached when these are tweaked).
+#     mmcv/mmdet/mmengine load these unconditionally at import time:
+#     - opencv-python: cv2 (image ops)
+#     - Pillow: PIL.Image / ImageEnhance (photometric augs)
+#     - scikit-image: occasional skimage.io / measure usage
+#     - tabulate: mmengine logging tables
+#     - numba + llvmlite: mmdet3d iou3d / box ops
+# --------------------------------------------------------------------------
+RUN pip install --no-deps \
+        opencv-python \
+        Pillow \
+        scikit-image \
+        tabulate \
+        numba \
+        llvmlite \
+        plotly \
+        dash \
+        flask \
+        werkzeug \
+        itsdangerous \
+        narwhals \
+        blinker \
+        pytz \
+        tzdata \
+        portalocker \
+        tensorboard \
+        absl-py \
+        future \
+        protobuf \
+        markdown \
+        grpcio \
+        MarkupSafe \
+        google-auth \
+        google-auth-oauthlib \
+        requests-oauthlib \
+        oauthlib \
+        rsa \
+        pyasn1 \
+        pyasn1_modules \
+        tensorboard-data-server \
+        tensorboard-plugin-wit
+
+# Layer 5 installed pyparsing without --upgrade, so pip kept the Debian system
+# `pyparsing 2.x` (in /usr/lib/python3/dist-packages/) which is older than
+# matplotlib needs (`one_of` was added in 3.0). Force-upgrade in /usr/local
+# so it overrides the system one on the import path.
+RUN pip install --no-deps --upgrade "pyparsing>=3.0"
+
+# Shapely 1.8.5 (pinned by the project) loads the GEOS C library at runtime
+# via libgeos_c.so. rsync is used by run_oracle_pipeline.sh for the final
+# export step. Install in a LATE apt layer so we don't invalidate the
+# heavy compile layers (cumm/spconv/mmcv) above this point.
+RUN apt-get update && apt-get install -y --no-install-recommends libgeos-dev rsync \
+    && rm -rf /var/lib/apt/lists/*
+
+# --------------------------------------------------------------------------
+# 9c. Downgrad 2.1.0 -> 2.0.1 at the end of the build to satisfy
+#     mmdet 3.0.0's hardcoded version assertion (mmcv>=2.0.0rc4, <2.1.0).
+#     We originally installed 2.1.0 because mmcv docs only claim torch 2.1
+#     support starting at 2.1, but in practice 2.0.x's pure-Python paths
+#     (which is all mmdet/mmdet3d actually use here) work fine with torch
+#     2.1. Doing the downgrade as a separate layer preserves the cache of
+#     every expensive CUDA-extension layer above this point.
+# --------------------------------------------------------------------------
+RUN pip uninstall -y mmcv \
+    && git clone --depth 1 -b v2.0.1 https://github.com/open-mmlab/mmcv.git /opt/mmcv \
+    && cd /opt/mmcv \
+    && sed -i "s/'-std=c++14'/'-std=c++17'/g" setup.py \
+    && MMCV_WITH_OPS=1 FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="8.7" MAX_JOBS=4 \
+        pip install --no-deps --no-build-isolation -v .
+
+# --------------------------------------------------------------------------
+# 9d. cumm wheel install via `pip install git+...` does NOT bundle the
+#     repo-root `include/tensorview` headers into the wheel. cumm's
+#     constants.py asserts `PACKAGE_ROOT.parent / "include"` exists at
+#     import-time, so without this the very first `import cumm` (and
+#     therefore `import spconv`) fails. Drop the headers in place from
+#     a fresh shallow clone. (See cumm v0.7.11 constants.py:35.)
+# --------------------------------------------------------------------------
+RUN git clone --depth 1 -b v0.7.11 \
+        https://github.com/FindDefinition/cumm.git /tmp/cumm_src \
+    && mkdir -p /usr/local/lib/python3.10/dist-packages/include \
+    && cp -r /tmp/cumm_src/include/* /usr/local/lib/python3.10/dist-packages/include/ \
+    && rm -rf /tmp/cumm_src
+
+# --------------------------------------------------------------------------
+# 9e. Rebuild cumm + spconv with their C++ pybind11 extensions actually
+#     COMPILED (not stub-JIT). Counter-intuitive flag names:
+#         CUMM_DISABLE_JIT=1  -> "build core_cc.so ahead of time"
+#         SPCONV_DISABLE_JIT=1 -> same for spconv.
+#     Without these, setup.py leaves ext_modules=[], the wheel ships pure
+#     Python, and `import cumm` fails immediately on `cumm.core_cc` lookup
+#     because the pybind11 module doesn't exist.
+#
+#     This is the slow layer (~30-60 min): CUDA compile of all sm_87
+#     kernels for both packages. But it's a one-time cost.
+# --------------------------------------------------------------------------
+ENV CUMM_DISABLE_JIT=1 \
+    SPCONV_DISABLE_JIT=1
+
+RUN pip uninstall -y cumm \
+    && pip install --no-deps --no-build-isolation -v --force-reinstall \
+        "git+https://github.com/FindDefinition/cumm.git@v0.7.11"
+
+RUN pip uninstall -y spconv \
+    && pip install --no-deps --no-build-isolation -v --force-reinstall \
+        "git+https://github.com/traveller59/spconv.git@v2.3.8"
+
+# --------------------------------------------------------------------------
+# 9f. Restore segmentator/csrc/build/libsegmentator.so.
+#     Layer 8 deletes csrc/build/ to save space, but segmentator's
+#     main.py imports literally `from .csrc.build.libsegmentator import ...`
+#     The cmake install only creates a symlink <purelib>/segmentator ->
+#     /opt/segmentator, so the .so MUST live at /opt/segmentator/csrc/build/.
+#     Rebuild the library (without redoing the install symlink, which is
+#     still intact). Adds ~5 min, preserves all cache above.
+# --------------------------------------------------------------------------
+RUN cd /opt/segmentator/csrc \
+    && mkdir -p build && cd build \
+    && cmake .. \
+        -DCMAKE_PREFIX_PATH=$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)') \
+        -DPYTHON_INCLUDE_DIR=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['include'])") \
+        -DPYTHON_LIBRARY=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR') + '/libpython3.10.so')") \
+    && make -j$MAX_JOBS \
+    && touch /opt/segmentator/csrc/__init__.py /opt/segmentator/csrc/build/__init__.py
+
+# --------------------------------------------------------------------------
+# 10. Runtime configuration
+#     Project dir is bind-mounted at /workspace by run_docker_locally_jetson.sh.
+#     The 3 mm-patches in /workspace/replace_mmdetection_files/ are applied at
+#     runtime by /workspace/entrypoint_ff3d.sh (which also handles tpk reinstalls).
+# --------------------------------------------------------------------------
+WORKDIR /workspace
+ENV PYTHONPATH=/workspace:/workspace/oneformer3d
+
+ENTRYPOINT ["bash", "-lc", "set -euo pipefail; bash /workspace/entrypoint_ff3d.sh"]
