@@ -3348,7 +3348,7 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
     def nearest_neighbor_mapping(pc1 : torch.Tensor,
                              pc3 : torch.Tensor,
                              preds: torch.Tensor | np.ndarray,
-                             chunk: int = 20_000) -> torch.Tensor:
+                             chunk: int = 2_000) -> torch.Tensor:
         # GPU Tensor
         if isinstance(preds, np.ndarray):
             preds = torch.from_numpy(preds).to(pc3.device, non_blocking=True)
@@ -3371,7 +3371,7 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
     def nearest_neighbor_mapping_2(pc1: torch.Tensor,
                                pc3: torch.Tensor,
                                preds: torch.Tensor,
-                               chunk: int = 20_000) -> torch.Tensor:
+                               chunk: int = 2_000) -> torch.Tensor:
 
         if isinstance(preds, np.ndarray):                     # keep downstream happy
             preds = torch.as_tensor(preds, device=pc3.device)

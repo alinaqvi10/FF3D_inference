@@ -9,7 +9,8 @@ num_instance_classes = 3
 num_semantic_classes = 3
 radius=16  #modify the radius of input cylinder
 score_th = 00.4
-chunk = 10_000
+chunk = 2_000
+num_points = 400_000   # max points fed to backbone per region; reduce to lower GPU memory
 model = dict(
     type='ForAINetV2OneFormer3D_XAwarequery',
     data_preprocessor=dict(type='Det3DDataPreprocessor'),

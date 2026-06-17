@@ -18,13 +18,17 @@ CONFIG_FILE="${CONFIG_FILE:-$WORK_DIR/configs/oneformer3d_qs_radius16_qp300_2man
 MODEL_PATH="${MODEL_PATH:-$WORK_DIR/work_dirs/clean_forestformer/epoch_3000_fix.pth}"
 
 # Number of inference iterations per scan
-ITERATIONS="${ITERATIONS:-2}"
+ITERATIONS="${ITERATIONS:-1}"
 
 # Output directory for all inference results
 BLUEPOINTS_DIR="${BLUEPOINTS_DIR:-$WORK_DIR/work_dirs/output}"
 
 # GPU ID to use (default: 1)
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
+# Reduce allocator fragmentation: GC at 80% capacity, 512 MB max split.
+# Has no effect on model outputs — purely a memory management hint.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.8,max_split_size_mb:512}"
 
 # Internal file paths
 TEST_LIST="$META_DIR/test_list.txt"

@@ -49,7 +49,7 @@ class CrossAttentionLayer(BaseModule):
         for i in range(len(sources)):
             k = v = sources[i]
             attn_mask = attn_masks[i] if attn_masks is not None else None
-            output, _ = self.attn(queries[i], k, v, attn_mask=attn_mask)
+            output, _ = self.attn(queries[i], k, v, attn_mask=attn_mask, need_weights=False)
             if self.fix:
                 output = self.dropout(output)
             output = output + queries[i]
@@ -731,36 +731,40 @@ class ForAINetv2QueryDecoder_XAwarequery(BaseModule):
         Returns:
             Dict: with labels, masks, scores, and aux_outputs.
         """
-        #cls_preds, pred_scores, pred_masks = [], [], []
-        pred_scores, pred_masks = [], []
         inst_feats = [self.input_proj(y) for y in x]  #[38584, 256]  [37025,256]
         mask_feats = [self.x_mask(y) for y in x]   #[38584, 256]  [37025,256]
         queries = self._get_queries(queries, len(x))  #2 x [403, 256]
-        #queries = queries.to(mask_feats.device)
-        #cls_pred, pred_score, pred_mask, attn_mask = self._forward_head(
-        pred_score, pred_mask, attn_mask = self._forward_head(
-            queries, mask_feats)
-        #cls_preds.append(cls_pred)
+
+        if not self.training:
+            # Inference path: keep only the current layer's tensors alive.
+            # aux_outputs is never read during predict_by_feat, so there is no
+            # accuracy impact — only the final pred_mask/pred_score are returned.
+            pred_score, pred_mask, attn_mask = self._forward_head(queries, mask_feats)
+            for i in range(len(self.cross_attn_layers)):
+                del pred_score, pred_mask  # free previous layer tensors
+                queries = self.cross_attn_layers[i](inst_feats, queries, attn_mask)
+                queries = self.self_attn_layers[i](queries)
+                queries = self.ffn_layers[i](queries)
+                pred_score, pred_mask, attn_mask = self._forward_head(queries, mask_feats)
+            return dict(masks=pred_mask, scores=pred_score, aux_outputs=[])
+
+        # Training path: accumulate all layers for auxiliary losses.
+        pred_scores, pred_masks = [], []
+        pred_score, pred_mask, attn_mask = self._forward_head(queries, mask_feats)
         pred_scores.append(pred_score)
         pred_masks.append(pred_mask)
         for i in range(len(self.cross_attn_layers)):
             queries = self.cross_attn_layers[i](inst_feats, queries, attn_mask)
             queries = self.self_attn_layers[i](queries)
             queries = self.ffn_layers[i](queries)  #2 x [403, 256]
-            #cls_pred, pred_score, pred_mask, attn_mask = self._forward_head(
-            pred_score, pred_mask, attn_mask = self._forward_head(
-                queries, mask_feats)
-            #cls_preds.append(cls_pred)
+            pred_score, pred_mask, attn_mask = self._forward_head(queries, mask_feats)
             pred_scores.append(pred_score)
             pred_masks.append(pred_mask)
 
         aux_outputs = [
-            #{'cls_preds': cls_pred, 'masks': masks, 'scores': scores}
             {'masks': masks, 'scores': scores}
-            for scores, masks in zip(
-                pred_scores[:-1], pred_masks[:-1])]
+            for scores, masks in zip(pred_scores[:-1], pred_masks[:-1])]
         return dict(
-            #cls_preds=cls_preds[-1],
             masks=pred_masks[-1],
             scores=pred_scores[-1],
             aux_outputs=aux_outputs)
